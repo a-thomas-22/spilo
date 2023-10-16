@@ -1,7 +1,6 @@
 #!/bin/bash
 
-function log
-{
+function log {
     echo "$(date "+%Y-%m-%d %H:%M:%S.%3N") - $0 - $*"
 }
 
@@ -9,9 +8,9 @@ function log
 
 log "I was called as: $0 $*"
 
-
 readonly PGDATA=$1
-DAYS_TO_RETAIN=$BACKUP_NUM_TO_RETAIN
+NUM_TO_RETAIN=${BACKUP_NUM_TO_RETAIN:-0}  # default to 0 if not set
+DAYS_TO_RETAIN=${DAYS_TO_RETAIN:-0}       # default to 0 if not set
 
 IN_RECOVERY=$(psql -tXqAc "select pg_catalog.pg_is_in_recovery()")
 readonly IN_RECOVERY
@@ -26,45 +25,26 @@ fi
 # leave at least 2 days base backups before creating a new one
 [[ "$DAYS_TO_RETAIN" -lt 2 ]] && DAYS_TO_RETAIN=2
 
-if [[ "$USE_WALG_BACKUP" == "true" ]]; then
-    readonly WAL_E="wal-g"
-    [[ -z $WALG_BACKUP_COMPRESSION_METHOD ]] || export WALG_COMPRESSION_METHOD=$WALG_BACKUP_COMPRESSION_METHOD
-    export PGHOST=/var/run/postgresql
-else
-    readonly WAL_E="wal-e"
-
-    # Ensure we don't have more workes than CPU's
-    POOL_SIZE=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || 1)
-    [ "$POOL_SIZE" -gt 4 ] && POOL_SIZE=4
-    POOL_SIZE=(--pool-size "$POOL_SIZE")
-fi
-
-BEFORE=""
-LEFT=0
-
+BACKUPS_TO_DELETE=()
 NOW=$(date +%s -u)
 readonly NOW
 while read -r name last_modified rest; do
     last_modified=$(date +%s -ud "$last_modified")
-    if [ $(((NOW-last_modified)/86400)) -ge $DAYS_TO_RETAIN ]; then
-        if [ -z "$BEFORE" ] || [ "$last_modified" -gt "$BEFORE_TIME" ]; then
-            BEFORE_TIME=$last_modified
-            BEFORE=$name
-        fi
-    else
-        # count how many backups will remain after we remove everything up to certain date
-        ((LEFT=LEFT+1))
+    age_days=$(((NOW-last_modified)/86400))
+    
+    if [[ $age_days -ge $DAYS_TO_RETAIN ]] && [[ ${#BACKUPS_TO_DELETE[@]} -lt $((NUM_TO_RETAIN-1)) ]]; then
+        BACKUPS_TO_DELETE+=("$name")
     fi
 done < <($WAL_E backup-list 2> /dev/null | sed '0,/^name\s*\(last_\)\?modified\s*/d')
 
-# we want keep at least N backups even if the number of days exceeded
-if [ -n "$BEFORE" ] && [ $LEFT -ge $DAYS_TO_RETAIN ]; then
+# Delete old backups, ensuring we retain the minimum number as per BACKUP_NUM_TO_RETAIN
+for backup in "${BACKUPS_TO_DELETE[@]}"; do
     if [[ "$USE_WALG_BACKUP" == "true" ]]; then
-        $WAL_E delete before FIND_FULL "$BEFORE" --confirm
+        $WAL_E delete --confirm FIND_FULL "$backup"
     else
-        $WAL_E delete --confirm before "$BEFORE"
+        $WAL_E delete --confirm "$backup"
     fi
-fi
+done
 
 # push a new base backup
 log "producing a new backup"
