@@ -25,6 +25,19 @@ fi
 # leave at least 2 days base backups before creating a new one
 [[ "$DAYS_TO_RETAIN" -lt 2 ]] && DAYS_TO_RETAIN=2
 
+# Determine whether to use wal-g or wal-e and set compression and POOL_SIZE
+if [[ "$USE_WALG_BACKUP" == "true" ]]; then
+    readonly WAL_E="wal-g"
+    [[ -z $WALG_BACKUP_COMPRESSION_METHOD ]] || export WALG_COMPRESSION_METHOD=$WALG_BACKUP_COMPRESSION_METHOD
+    export PGHOST=/var/run/postgresql
+else
+    readonly WAL_E="wal-e"
+    # Ensure we don't have more workers than CPU's
+    POOL_SIZE=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+    [ "$POOL_SIZE" -gt 4 ] && POOL_SIZE=4
+    POOL_SIZE=(--pool-size "$POOL_SIZE")
+fi
+
 BACKUPS_TO_DELETE=()
 NOW=$(date +%s -u)
 readonly NOW
