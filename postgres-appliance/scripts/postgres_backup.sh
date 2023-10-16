@@ -1,6 +1,7 @@
 #!/bin/bash
 
-function log {
+function log
+{
     echo "$(date "+%Y-%m-%d %H:%M:%S.%3N") - $0 - $*"
 }
 
@@ -9,8 +10,13 @@ function log {
 log "I was called as: $0 $*"
 
 readonly PGDATA=$1
-NUM_TO_RETAIN=${BACKUP_NUM_TO_RETAIN:-0}  # default to 0 if not set
-DAYS_TO_RETAIN=${DAYS_TO_RETAIN:-0}       # default to 0 if not set
+
+# Check if DAYS_TO_RETAIN is set externally
+if [[ -z $DAYS_TO_RETAIN ]]; then
+    DAYS_TO_RETAIN=$BACKUP_NUM_TO_RETAIN
+    # leave at least 2 days base backups before creating a new one
+    [[ "$DAYS_TO_RETAIN" -lt 2 ]] && DAYS_TO_RETAIN=2
+fi
 
 IN_RECOVERY=$(psql -tXqAc "select pg_catalog.pg_is_in_recovery()")
 readonly IN_RECOVERY
@@ -22,42 +28,44 @@ else
     log "ERROR: Recovery state unknown: $IN_RECOVERY" && exit 1
 fi
 
-# leave at least 2 days base backups before creating a new one
-[[ "$DAYS_TO_RETAIN" -lt 2 ]] && DAYS_TO_RETAIN=2
-
-# Determine whether to use wal-g or wal-e and set compression and POOL_SIZE
 if [[ "$USE_WALG_BACKUP" == "true" ]]; then
     readonly WAL_E="wal-g"
     [[ -z $WALG_BACKUP_COMPRESSION_METHOD ]] || export WALG_COMPRESSION_METHOD=$WALG_BACKUP_COMPRESSION_METHOD
     export PGHOST=/var/run/postgresql
 else
     readonly WAL_E="wal-e"
-    # Ensure we don't have more workers than CPU's
+    # Ensure we don't have more workers than CPUs
     POOL_SIZE=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
     [ "$POOL_SIZE" -gt 4 ] && POOL_SIZE=4
     POOL_SIZE=(--pool-size "$POOL_SIZE")
 fi
 
-BACKUPS_TO_DELETE=()
+BEFORE=""
+LEFT=0
+
 NOW=$(date +%s -u)
 readonly NOW
 while read -r name last_modified rest; do
     last_modified=$(date +%s -ud "$last_modified")
-    age_days=$(((NOW-last_modified)/86400))
-    
-    if [[ $age_days -ge $DAYS_TO_RETAIN ]] && [[ ${#BACKUPS_TO_DELETE[@]} -lt $((NUM_TO_RETAIN-1)) ]]; then
-        BACKUPS_TO_DELETE+=("$name")
+    if [ $(((NOW-last_modified)/86400)) -ge $DAYS_TO_RETAIN ]; then
+        if [ -z "$BEFORE" ] || [ "$last_modified" -gt "$BEFORE_TIME" ]; then
+            BEFORE_TIME=$last_modified
+            BEFORE=$name
+        fi
+    else
+        # count how many backups will remain after we remove everything up to a certain date
+        ((LEFT=LEFT+1))
     fi
 done < <($WAL_E backup-list 2> /dev/null | sed '0,/^name\s*\(last_\)\?modified\s*/d')
 
-# Delete old backups, ensuring we retain the minimum number as per BACKUP_NUM_TO_RETAIN
-for backup in "${BACKUPS_TO_DELETE[@]}"; do
+# we want to keep at least N backups even if the number of days exceeded
+if [ -n "$BEFORE" ] && [ $LEFT -ge $DAYS_TO_RETAIN ]; then
     if [[ "$USE_WALG_BACKUP" == "true" ]]; then
-        $WAL_E delete --confirm FIND_FULL "$backup"
+        $WAL_E delete before FIND_FULL "$BEFORE" --confirm
     else
-        $WAL_E delete --confirm "$backup"
+        $WAL_E delete --confirm before "$BEFORE"
     fi
-done
+fi
 
 # push a new base backup
 log "producing a new backup"
